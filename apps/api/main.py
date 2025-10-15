@@ -8,6 +8,8 @@ from typing import Optional
 from pydantic import BaseModel
 import requests
 import json
+from supabase import create_client, Client
+from datetime import datetime
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -27,6 +29,14 @@ app.add_middleware(
 
 # Global variables for Whisper model
 whisper_model = None
+
+# Initialize Supabase client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Configuration
 class TranscriptionConfig:
@@ -54,6 +64,13 @@ class SummarizeResponse(BaseModel):
     summary: str
     flashcards: list[Flashcard]
 
+class SaveNoteRequest(BaseModel):
+    transcript: str
+    summary: str
+    flashcards: list[Flashcard]
+    user_id: Optional[str] = None
+    title: Optional[str] = None
+
 # Initialize Whisper model on startup
 @app.on_event("startup")
 async def startup_event():
@@ -63,132 +80,117 @@ async def startup_event():
         whisper_model = whisper.load_model(config.WHISPER_MODEL_SIZE)
         print("Whisper model loaded successfully")
     else:
-        print("Using Deepgram API for transcription")
+        print("Using Deepgram for transcription")
 
 # Health check endpoint
 @app.get("/")
-async def root():
-    return {"message": "Audio Transcription API is running", "provider": "Deepgram" if config.USE_DEEPGRAM else "Whisper Local"}
-
-# Health check endpoint
-@app.get("/health")
 async def health_check():
-    return {"status": "healthy", "provider": "Deepgram" if config.USE_DEEPGRAM else "Whisper Local"}
+    return {"status": "healthy", "service": "Audio Transcription API"}
 
-# Transcription with Deepgram
-async def transcribe_with_deepgram(audio_data: bytes, filename: str) -> TranscriptionResponse:
+# Transcription helper function for Deepgram
+async def transcribe_with_deepgram(file_path: str) -> dict:
+    """
+    Transcribe audio using Deepgram API.
+    """
     if not config.DEEPGRAM_API_KEY:
-        raise HTTPException(status_code=500, detail="Deepgram API key not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="Deepgram API key not configured"
+        )
     
     url = "https://api.deepgram.com/v1/listen"
     headers = {
         "Authorization": f"Token {config.DEEPGRAM_API_KEY}",
-        "Content-Type": "audio/wav"  # Adjust based on file type
+        "Content-Type": "audio/wav"
     }
     
-    params = {
-        "model": "nova-2",
+    with open(file_path, "rb") as audio_file:
+        response = requests.post(url, headers=headers, data=audio_file)
+    
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Deepgram API error: {response.text}"
+        )
+    
+    result = response.json()
+    transcript = result["results"]["channels"][0]["alternatives"][0]["transcript"]
+    confidence = result["results"]["channels"][0]["alternatives"][0]["confidence"]
+    
+    return {
+        "text": transcript,
+        "confidence": confidence,
         "language": "en",
-        "smart_format": "true"
+        "provider": "Deepgram"
     }
-    
-    try:
-        response = requests.post(url, headers=headers, params=params, data=audio_data)
-        response.raise_for_status()
-        
-        result = response.json()
-        transcript = result["results"]["channels"][0]["alternatives"][0]["transcript"]
-        confidence = result["results"]["channels"][0]["alternatives"][0]["confidence"]
-        
-        return TranscriptionResponse(
-            text=transcript,
-            confidence=confidence,
-            provider="Deepgram"
-        )
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Deepgram API error: {str(e)}")
-    except (KeyError, IndexError) as e:
-        raise HTTPException(status_code=500, detail=f"Error parsing Deepgram response: {str(e)}")
 
-# Transcription with local Whisper
-async def transcribe_with_whisper(audio_data: bytes, filename: str) -> TranscriptionResponse:
-    global whisper_model
-    
+# Transcription helper function for local Whisper
+async def transcribe_with_whisper(file_path: str) -> dict:
+    """
+    Transcribe audio using local Whisper model.
+    """
     if whisper_model is None:
-        raise HTTPException(status_code=500, detail="Whisper model not loaded")
-    
-    # Save uploaded file to temporary location
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp_file:
-        tmp_file.write(audio_data)
-        tmp_file_path = tmp_file.name
-    
-    try:
-        # Transcribe with Whisper
-        result = whisper_model.transcribe(tmp_file_path)
-        
-        return TranscriptionResponse(
-            text=result["text"].strip(),
-            language=result.get("language"),
-            provider="Whisper Local"
+        raise HTTPException(
+            status_code=500,
+            detail="Whisper model not loaded"
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Whisper transcription error: {str(e)}")
-    finally:
-        # Clean up temporary file
-        if os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
+    
+    result = whisper_model.transcribe(file_path)
+    
+    return {
+        "text": result["text"],
+        "language": result.get("language"),
+        "provider": "Whisper Local"
+    }
 
 # Main transcription endpoint
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(file: UploadFile = File(...)):
     """
-    Transcribe audio file using either Whisper (local) or Deepgram API
-    
-    Supported formats: wav, mp3, mp4, m4a, flac, ogg, webm
+    Transcribe an uploaded audio file using either Deepgram or local Whisper.
     """
-    
     # Validate file type
-    allowed_extensions = {".wav", ".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".webm"}
-    file_extension = os.path.splitext(file.filename)[1].lower()
-    
-    if file_extension not in allowed_extensions:
+    allowed_types = ["audio/wav", "audio/mpeg", "audio/mp3", "audio/m4a", "audio/webm"]
+    if file.content_type not in allowed_types:
         raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported file format. Allowed: {', '.join(allowed_extensions)}"
+            status_code=400,
+            detail=f"Unsupported file type: {file.content_type}. Supported types: {', '.join(allowed_types)}"
         )
     
-    # Check file size (limit to 25MB)
-    max_file_size = 25 * 1024 * 1024  # 25MB
-    audio_data = await file.read()
-    
-    if len(audio_data) > max_file_size:
-        raise HTTPException(status_code=400, detail="File size too large. Maximum 25MB allowed.")
-    
-    if len(audio_data) == 0:
-        raise HTTPException(status_code=400, detail="Empty file uploaded")
+    # Save uploaded file to temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+        content = await file.read()
+        temp_file.write(content)
+        temp_file_path = temp_file.name
     
     try:
         # Choose transcription method based on configuration
         if config.USE_DEEPGRAM:
-            return await transcribe_with_deepgram(audio_data, file.filename)
+            result = await transcribe_with_deepgram(temp_file_path)
         else:
-            return await transcribe_with_whisper(audio_data, file.filename)
+            result = await transcribe_with_whisper(temp_file_path)
+        
+        return TranscriptionResponse(**result)
     
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transcription failed: {str(e)}"
+        )
+    
+    finally:
+        # Clean up temporary file
+        if os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
 
 # Batch transcription endpoint
 @app.post("/transcribe/batch")
 async def transcribe_batch(files: list[UploadFile] = File(...)):
     """
-    Transcribe multiple audio files
+    Transcribe multiple audio files in a batch.
     """
-    if len(files) > 10:
-        raise HTTPException(status_code=400, detail="Maximum 10 files allowed per batch")
-    
     results = []
+    
     for i, file in enumerate(files):
         try:
             result = await transcribe_audio(file)
@@ -242,7 +244,7 @@ async def summarize_transcript(request: SummarizeRequest):
         Flashcard(question="What are the key points?", answer="Placeholder answer 2"),
         Flashcard(question="What is the conclusion?", answer="Placeholder answer 3"),
         Flashcard(question="What are the important details?", answer="Placeholder answer 4"),
-        Flashcard(question="What should you remember?", answer="Placeholder answer 5")
+        Flashcard(question="What should you remember?", answer="Placeholder answer 5"),
     ]
     
     return SummarizeResponse(
@@ -250,13 +252,59 @@ async def summarize_transcript(request: SummarizeRequest):
         flashcards=flashcards
     )
 
+# Save note endpoint
+@app.post("/saveNote")
+async def save_note(request: SaveNoteRequest):
+    """
+    Save transcript, summary, and flashcards to Supabase database.
+    """
+    if not supabase:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase client not configured. Please set SUPABASE_URL and SUPABASE_KEY environment variables."
+        )
+    
+    if not request.transcript or len(request.transcript.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Transcript cannot be empty")
+    
+    if not request.summary or len(request.summary.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Summary cannot be empty")
+    
+    try:
+        # Prepare note data
+        note_data = {
+            "transcript": request.transcript,
+            "summary": request.summary,
+            "flashcards": [flashcard.dict() for flashcard in request.flashcards],
+            "user_id": request.user_id,
+            "title": request.title or f"Note - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Insert into Supabase
+        response = supabase.table("notes").insert(note_data).execute()
+        
+        return {
+            "status": "success",
+            "message": "Note saved successfully",
+            "note_id": response.data[0]["id"] if response.data else None,
+            "data": response.data[0] if response.data else None
+        }
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save note: {str(e)}"
+        )
+
 # Configuration endpoint
 @app.get("/config")
 async def get_config():
     return {
         "provider": "Deepgram" if config.USE_DEEPGRAM else "Whisper Local",
         "whisper_model_size": config.WHISPER_MODEL_SIZE if not config.USE_DEEPGRAM else None,
-        "deepgram_configured": bool(config.DEEPGRAM_API_KEY) if config.USE_DEEPGRAM else None
+        "deepgram_configured": bool(config.DEEPGRAM_API_KEY) if config.USE_DEEPGRAM else None,
+        "supabase_configured": bool(supabase)
     }
 
 if __name__ == "__main__":
