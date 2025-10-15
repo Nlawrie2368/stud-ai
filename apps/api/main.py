@@ -43,6 +43,17 @@ class TranscriptionResponse(BaseModel):
     confidence: Optional[float] = None
     provider: str
 
+class SummarizeRequest(BaseModel):
+    transcript: str
+
+class Flashcard(BaseModel):
+    question: str
+    answer: str
+
+class SummarizeResponse(BaseModel):
+    summary: str
+    flashcards: list[Flashcard]
+
 # Initialize Whisper model on startup
 @app.on_event("startup")
 async def startup_event():
@@ -196,6 +207,48 @@ async def transcribe_batch(files: list[UploadFile] = File(...)):
             })
     
     return {"results": results}
+
+# Summarization endpoint
+@app.post("/summarize", response_model=SummarizeResponse)
+async def summarize_transcript(request: SummarizeRequest):
+    """
+    Generate a summary and flashcards from transcript text using OpenAI.
+    
+    NOTE: This is a placeholder implementation. In production, this should call
+    OpenAI's API with proper authentication and error handling.
+    """
+    
+    if not request.transcript or len(request.transcript.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Transcript text cannot be empty")
+    
+    # TODO: Replace with actual OpenAI API call
+    # Example OpenAI integration:
+    # import openai
+    # openai.api_key = os.getenv("OPENAI_API_KEY")
+    # 
+    # response = openai.ChatCompletion.create(
+    #     model="gpt-4",
+    #     messages=[
+    #         {"role": "system", "content": "You are a helpful assistant that summarizes transcripts and creates flashcards."},
+    #         {"role": "user", "content": f"Summarize this transcript and create 5 flashcards: {request.transcript}"}
+    #     ]
+    # )
+    
+    # Placeholder response
+    summary = f"This is a placeholder summary of the transcript (first 100 chars): {request.transcript[:100]}..."
+    
+    flashcards = [
+        Flashcard(question="What is the main topic?", answer="Placeholder answer 1"),
+        Flashcard(question="What are the key points?", answer="Placeholder answer 2"),
+        Flashcard(question="What is the conclusion?", answer="Placeholder answer 3"),
+        Flashcard(question="What are the important details?", answer="Placeholder answer 4"),
+        Flashcard(question="What should you remember?", answer="Placeholder answer 5")
+    ]
+    
+    return SummarizeResponse(
+        summary=summary,
+        flashcards=flashcards
+    )
 
 # Configuration endpoint
 @app.get("/config")
